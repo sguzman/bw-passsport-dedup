@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, ValueEnum};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -33,17 +34,21 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Keep::First)]
     keep: Keep,
 
+    /// Config file (TOML)
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     /// Ignore any keys with these names, anywhere in the item
     #[arg(
         long,
         value_delimiter = ',',
-        default_value = "id,revisionDate,creationDate,passwordHistory"
+        value_name = "KEYS"
     )]
-    ignore_key: Vec<String>,
+    ignore_key: Option<Vec<String>>,
 
     /// Ignore specific paths (dot-separated), relative to each item
-    #[arg(long, value_delimiter = ',')]
-    ignore_path: Vec<String>,
+    #[arg(long, value_delimiter = ',', value_name = "PATHS")]
+    ignore_path: Option<Vec<String>>,
 
     /// Trim whitespace from all string values before hashing
     #[arg(long, action = ArgAction::SetTrue)]
@@ -56,14 +61,116 @@ struct Args {
     /// Sort login.uris entries by URI before hashing
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     sort_uris: bool,
+
+    /// Deduplication keys (comma-separated). Overrides config.
+    #[arg(long, value_delimiter = ',', value_name = "KEYS")]
+    policy_key: Option<Vec<DedupKey>>,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, Deserialize, ValueEnum, PartialEq, Eq)]
 enum Keep {
     First,
     Last,
     Newest,
     Oldest,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct Config {
+    dedup: DedupConfig,
+    ignore: IgnoreConfig,
+    normalize: NormalizeConfig,
+    output: OutputConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct DedupConfig {
+    keep: Keep,
+    policy_keys: Vec<DedupKey>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct IgnoreConfig {
+    keys: Vec<String>,
+    paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct NormalizeConfig {
+    trim_strings: bool,
+    lowercase_strings: bool,
+    sort_uris: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct OutputConfig {
+    pretty: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, ValueEnum, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum DedupKey {
+    Domain,
+    Username,
+    Password,
+    Name,
+    Uri,
+    Totp,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            dedup: DedupConfig::default(),
+            ignore: IgnoreConfig::default(),
+            normalize: NormalizeConfig::default(),
+            output: OutputConfig::default(),
+        }
+    }
+}
+
+impl Default for DedupConfig {
+    fn default() -> Self {
+        Self {
+            keep: Keep::First,
+            policy_keys: vec![DedupKey::Domain, DedupKey::Username, DedupKey::Password],
+        }
+    }
+}
+
+impl Default for IgnoreConfig {
+    fn default() -> Self {
+        Self {
+            keys: vec![
+                "id".to_string(),
+                "revisionDate".to_string(),
+                "creationDate".to_string(),
+                "passwordHistory".to_string(),
+            ],
+            paths: Vec::new(),
+        }
+    }
+}
+
+impl Default for NormalizeConfig {
+    fn default() -> Self {
+        Self {
+            trim_strings: false,
+            lowercase_strings: false,
+            sort_uris: true,
+        }
+    }
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self { pretty: false }
+    }
 }
 
 fn main() -> Result<()> {
@@ -82,6 +189,33 @@ fn main() -> Result<()> {
         );
     }
 
+    let mut config = load_config(args.config.as_deref())?;
+
+    if args.keep != Keep::First {
+        config.dedup.keep = args.keep;
+    }
+    if let Some(keys) = args.policy_key.clone() {
+        config.dedup.policy_keys = keys;
+    }
+    if let Some(keys) = args.ignore_key.clone() {
+        config.ignore.keys = keys;
+    }
+    if let Some(paths) = args.ignore_path.clone() {
+        config.ignore.paths = paths;
+    }
+    if args.trim_strings {
+        config.normalize.trim_strings = true;
+    }
+    if args.lowercase_strings {
+        config.normalize.lowercase_strings = true;
+    }
+    if args.sort_uris != config.normalize.sort_uris {
+        config.normalize.sort_uris = args.sort_uris;
+    }
+    if args.pretty {
+        config.output.pretty = true;
+    }
+
     let input_data = fs::read_to_string(input)
         .with_context(|| format!("failed to read input file {}", input.display()))?;
 
@@ -93,14 +227,16 @@ fn main() -> Result<()> {
         .and_then(Value::as_array_mut)
         .context("expected top-level 'items' array in Bitwarden export")?;
 
-    let ignore_keys = args
-        .ignore_key
+    let ignore_keys = config
+        .ignore
+        .keys
         .iter()
         .map(|s| s.to_string())
         .collect::<HashSet<_>>();
 
-    let ignore_paths = args
-        .ignore_path
+    let ignore_paths = config
+        .ignore
+        .paths
         .iter()
         .filter(|s| !s.trim().is_empty())
         .map(|s| parse_path(s))
@@ -113,11 +249,9 @@ fn main() -> Result<()> {
     for item in items.drain(..) {
         let key = build_key(
             &item,
+            &config,
             &ignore_keys,
             &ignore_paths,
-            args.trim_strings,
-            args.lowercase_strings,
-            args.sort_uris,
         );
 
         match seen.get(&key).copied() {
@@ -130,7 +264,7 @@ fn main() -> Result<()> {
                 let replace = should_replace(
                     &deduped[existing_index],
                     &item,
-                    args.keep,
+                    config.dedup.keep,
                 );
                 if replace {
                     deduped[existing_index] = item;
@@ -154,7 +288,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let output_data = if args.pretty {
+    let output_data = if config.output.pretty {
         serde_json::to_string_pretty(&root)?
     } else {
         serde_json::to_string(&root)?
@@ -197,23 +331,127 @@ fn parse_path(path: &str) -> Vec<String> {
 
 fn build_key(
     item: &Value,
+    config: &Config,
     ignore_keys: &HashSet<String>,
     ignore_paths: &[Vec<String>],
-    trim_strings: bool,
-    lowercase_strings: bool,
-    sort_uris: bool,
 ) -> String {
+    if !config.dedup.policy_keys.is_empty() {
+        let mut policy_value = build_policy_value(item, &config.dedup.policy_keys);
+        if config.normalize.sort_uris {
+            sort_login_uris(&mut policy_value);
+        }
+        normalize_strings(
+            &mut policy_value,
+            config.normalize.trim_strings,
+            config.normalize.lowercase_strings,
+        );
+        let canonical = canonicalize(&policy_value);
+        return serde_json::to_string(&canonical).unwrap_or_default();
+    }
+
     let mut working = item.clone();
     remove_keys_anywhere(&mut working, ignore_keys);
     for path in ignore_paths {
         remove_path(&mut working, path);
     }
-    if sort_uris {
+    if config.normalize.sort_uris {
         sort_login_uris(&mut working);
     }
-    normalize_strings(&mut working, trim_strings, lowercase_strings);
+    normalize_strings(
+        &mut working,
+        config.normalize.trim_strings,
+        config.normalize.lowercase_strings,
+    );
     let canonical = canonicalize(&working);
     serde_json::to_string(&canonical).unwrap_or_default()
+}
+
+fn build_policy_value(item: &Value, keys: &[DedupKey]) -> Value {
+    let mut map = Map::new();
+    for key in keys {
+        match key {
+            DedupKey::Domain => {
+                let domains = extract_domains(item);
+                map.insert("domain".to_string(), Value::Array(domains));
+            }
+            DedupKey::Username => {
+                map.insert("username".to_string(), extract_login_field(item, "username"));
+            }
+            DedupKey::Password => {
+                map.insert("password".to_string(), extract_login_field(item, "password"));
+            }
+            DedupKey::Name => {
+                map.insert(
+                    "name".to_string(),
+                    item.get("name").cloned().unwrap_or(Value::Null),
+                );
+            }
+            DedupKey::Uri => {
+                let uris = extract_uris(item);
+                map.insert("uri".to_string(), Value::Array(uris));
+            }
+            DedupKey::Totp => {
+                map.insert("totp".to_string(), extract_login_field(item, "totp"));
+            }
+        }
+    }
+    Value::Object(map)
+}
+
+fn extract_login_field(item: &Value, field: &str) -> Value {
+    item.get("login")
+        .and_then(Value::as_object)
+        .and_then(|login| login.get(field))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn extract_uris(item: &Value) -> Vec<Value> {
+    let mut uris = Vec::new();
+    if let Some(login) = item.get("login").and_then(Value::as_object) {
+        if let Some(Value::Array(items)) = login.get("uris") {
+            for entry in items {
+                match entry {
+                    Value::Object(map) => {
+                        if let Some(Value::String(uri)) = map.get("uri") {
+                            uris.push(Value::String(uri.clone()));
+                        }
+                    }
+                    Value::String(uri) => uris.push(Value::String(uri.clone())),
+                    _ => {}
+                }
+            }
+        }
+    }
+    uris
+}
+
+fn extract_domains(item: &Value) -> Vec<Value> {
+    let mut domains: Vec<String> = Vec::new();
+    for uri_value in extract_uris(item) {
+        if let Value::String(uri) = uri_value {
+            if let Some(host) = extract_domain_from_uri(&uri) {
+                domains.push(host);
+            } else {
+                domains.push(uri);
+            }
+        }
+    }
+    domains.sort();
+    domains.dedup();
+    domains.into_iter().map(Value::String).collect()
+}
+
+fn extract_domain_from_uri(uri: &str) -> Option<String> {
+    let without_scheme = uri.split("://").nth(1).unwrap_or(uri);
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host = host_port.split('@').last().unwrap_or(host_port);
+    let host = host.split(':').next().unwrap_or(host);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
 
 fn remove_keys_anywhere(value: &mut Value, ignore_keys: &HashSet<String>) {
@@ -361,4 +599,21 @@ fn best_date(item: &Value) -> Option<&str> {
     item.get("revisionDate")
         .and_then(Value::as_str)
         .or_else(|| item.get("creationDate").and_then(Value::as_str))
+}
+
+fn load_config(path: Option<&Path>) -> Result<Config> {
+    let default_path = PathBuf::from("config.toml");
+    let config_path = path.unwrap_or(&default_path);
+
+    if config_path.exists() {
+        let contents = fs::read_to_string(config_path).with_context(|| {
+            format!("failed to read config file {}", config_path.display())
+        })?;
+        let config: Config = toml::from_str(&contents).with_context(|| {
+            format!("failed to parse config file {}", config_path.display())
+        })?;
+        Ok(config)
+    } else {
+        Ok(Config::default())
+    }
 }

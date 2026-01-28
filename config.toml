@@ -1,0 +1,20 @@
+[dedup]
+# Keep strategy when duplicates are found: first | last | newest | oldest
+keep = "first"
+# Policy keys used to define a duplicate.
+# Available: domain, username, password, name, uri, totp
+policy_keys = ["domain", "username", "password"]
+
+[ignore]
+# Keys ignored anywhere in the item when policy_keys is empty.
+keys = ["id", "revisionDate", "creationDate", "passwordHistory"]
+# Dot-separated paths ignored when policy_keys is empty.
+paths = []
+
+[normalize]
+trim_strings = true
+lowercase_strings = true
+sort_uris = true
+
+[output]
+pretty = false

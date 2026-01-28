@@ -3,6 +3,8 @@
 Deduplicate Bitwarden JSON exports by hashing each item after removing volatile fields
 (like IDs and timestamps). Produces a cleaned export you can re-import.
 
+By default it uses `config.toml`, which defines what counts as a duplicate.
+
 ## Build
 
 ```bash
@@ -18,6 +20,21 @@ cargo run -- \
   --pretty
 ```
 
+### Config
+
+The tool looks for `config.toml` in the current directory (or use `--config <FILE>`).
+
+Default policy is domain + username + password:
+
+```toml
+[dedup]
+keep = "first"
+policy_keys = ["domain", "username", "password"]
+```
+
+If you want full-item hashing instead of policy keys, set `policy_keys = []` and
+use the ignore lists to control which fields are excluded.
+
 ### Common flags
 
 - `--input <FILE>`: Bitwarden JSON export (required)
@@ -31,6 +48,8 @@ cargo run -- \
 - `--trim-strings`: Trim whitespace before hashing
 - `--lowercase-strings`: Lowercase strings before hashing
 - `--sort-uris[=true|false]`: Sort `login.uris` before hashing (default: true)
+- `--policy-key <a,b,c>`: Override config policy keys (e.g., `domain,username,password`)
+- `--config <FILE>`: Load settings from a TOML file
 
 ### Examples
 
