@@ -1,0 +1,52 @@
+# bw-passport-dedup
+
+Deduplicate Bitwarden JSON exports by hashing each item after removing volatile fields
+(like IDs and timestamps). Produces a cleaned export you can re-import.
+
+## Build
+
+```bash
+cargo build --release
+```
+
+## Usage
+
+```bash
+cargo run -- \
+  --input tmp/bitwarden_export_20260128034458.json \
+  --output tmp/bitwarden_export_20260128034458.dedup.json \
+  --pretty
+```
+
+### Common flags
+
+- `--input <FILE>`: Bitwarden JSON export (required)
+- `--output <FILE>`: Output file (default: `<input>.dedup.json`)
+- `--pretty`: Pretty-print output JSON
+- `--dry-run`: Show counts without writing output
+- `--force`: Overwrite output file if it exists
+- `--keep <first|last|newest|oldest>`: Choose which duplicate to keep
+- `--ignore-key <a,b,c>`: Ignore keys anywhere in the item (default: `id,revisionDate,creationDate,passwordHistory`)
+- `--ignore-path <a.b.c>`: Ignore a specific path relative to each item
+- `--trim-strings`: Trim whitespace before hashing
+- `--lowercase-strings`: Lowercase strings before hashing
+- `--sort-uris[=true|false]`: Sort `login.uris` before hashing (default: true)
+
+### Examples
+
+Ignore URI order and keep the newest revision:
+
+```bash
+cargo run -- \
+  --input tmp/bitwarden_export_20260128034458.json \
+  --keep newest \
+  --sort-uris=true
+```
+
+Ignore the notes field when computing duplicates:
+
+```bash
+cargo run -- \
+  --input tmp/bitwarden_export_20260128034458.json \
+  --ignore-key notes
+```
