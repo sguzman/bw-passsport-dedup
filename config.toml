@@ -1,6 +1,6 @@
 [dedup]
 # Keep strategy when duplicates are found: first | last | newest | oldest
-keep = "first"
+keep = "First"
 # Policy keys used to define a duplicate.
 # Available: domain, username, password, name, uri, totp
 policy_keys = ["domain", "username", "password"]

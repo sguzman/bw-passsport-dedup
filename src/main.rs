@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -65,6 +65,10 @@ struct Args {
     /// Deduplication keys (comma-separated). Overrides config.
     #[arg(long, value_delimiter = ',', value_name = "KEYS")]
     policy_key: Option<Vec<DedupKey>>,
+
+    /// Write a JSON report of duplicate groups
+    #[arg(long, value_name = "FILE")]
+    report: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, ValueEnum, PartialEq, Eq)]
@@ -121,6 +125,24 @@ enum DedupKey {
     Name,
     Uri,
     Totp,
+}
+
+#[derive(Debug, Serialize)]
+struct Report {
+    total_items: usize,
+    duplicate_groups: usize,
+    removed: usize,
+    groups: Vec<ReportGroup>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportGroup {
+    key: String,
+    policy_value: Option<Value>,
+    count: usize,
+    sample_names: Vec<String>,
+    sample_ids: Vec<String>,
+    differing_paths: Vec<String>,
 }
 
 impl Default for Config {
@@ -227,6 +249,8 @@ fn main() -> Result<()> {
         .and_then(Value::as_array_mut)
         .context("expected top-level 'items' array in Bitwarden export")?;
 
+    let mut items_vec = std::mem::take(items);
+
     let ignore_keys = config
         .ignore
         .keys
@@ -242,11 +266,25 @@ fn main() -> Result<()> {
         .map(|s| parse_path(s))
         .collect::<Vec<_>>();
 
+    if let Some(report_path) = args.report.as_ref() {
+        let report = build_report(
+            &items_vec,
+            &config,
+            &ignore_keys,
+            &ignore_paths,
+        );
+        let report_data = serde_json::to_string_pretty(&report)?;
+        fs::write(report_path, report_data).with_context(|| {
+            format!("failed to write report file {}", report_path.display())
+        })?;
+        println!("Wrote report {}", report_path.display());
+    }
+
     let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut deduped: Vec<Value> = Vec::with_capacity(items.len());
+    let mut deduped: Vec<Value> = Vec::with_capacity(items_vec.len());
     let mut removed = 0usize;
 
-    for item in items.drain(..) {
+    for item in items_vec.drain(..) {
         let key = build_key(
             &item,
             &config,
@@ -452,6 +490,153 @@ fn extract_domain_from_uri(uri: &str) -> Option<String> {
     } else {
         Some(host.to_string())
     }
+}
+
+fn build_report(
+    items: &[Value],
+    config: &Config,
+    ignore_keys: &HashSet<String>,
+    ignore_paths: &[Vec<String>],
+) -> Report {
+    let mut groups: HashMap<String, Vec<&Value>> = HashMap::new();
+    for item in items {
+        let key = build_key(item, config, ignore_keys, ignore_paths);
+        groups.entry(key).or_default().push(item);
+    }
+
+    let mut report_groups = Vec::new();
+    let mut removed = 0usize;
+
+    for (key, group) in groups {
+        if group.len() <= 1 {
+            continue;
+        }
+        removed += group.len() - 1;
+        let sample_names = group
+            .iter()
+            .filter_map(|item| item.get("name").and_then(Value::as_str))
+            .take(5)
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let sample_ids = group
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .take(5)
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let differing_paths = collect_differing_paths(group.as_slice(), ignore_keys, ignore_paths);
+        let policy_value = if config.dedup.policy_keys.is_empty() {
+            None
+        } else {
+            Some(build_policy_value(group[0], &config.dedup.policy_keys))
+        };
+
+        report_groups.push(ReportGroup {
+            key,
+            policy_value,
+            count: group.len(),
+            sample_names,
+            sample_ids,
+            differing_paths,
+        });
+    }
+
+    report_groups.sort_by(|a, b| b.count.cmp(&a.count));
+
+    Report {
+        total_items: items.len(),
+        duplicate_groups: report_groups.len(),
+        removed,
+        groups: report_groups,
+    }
+}
+
+fn collect_differing_paths(
+    items: &[&Value],
+    ignore_keys: &HashSet<String>,
+    ignore_paths: &[Vec<String>],
+) -> Vec<String> {
+    if items.len() < 2 {
+        return Vec::new();
+    }
+    let mut diffs = HashSet::new();
+    let baseline = items[0];
+    for item in &items[1..] {
+        diff_values(
+            baseline,
+            item,
+            &mut Vec::new(),
+            &mut diffs,
+            ignore_keys,
+            ignore_paths,
+        );
+    }
+    let mut paths = diffs.into_iter().collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+fn diff_values(
+    a: &Value,
+    b: &Value,
+    path: &mut Vec<String>,
+    diffs: &mut HashSet<String>,
+    ignore_keys: &HashSet<String>,
+    ignore_paths: &[Vec<String>],
+) {
+    if a == b {
+        return;
+    }
+    if is_ignored_path(path, ignore_paths) {
+        return;
+    }
+
+    match (a, b) {
+        (Value::Object(a_map), Value::Object(b_map)) => {
+            let mut keys: Vec<&String> = a_map.keys().chain(b_map.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                if ignore_keys.contains(key) {
+                    continue;
+                }
+                let a_val = a_map.get(key);
+                let b_val = b_map.get(key);
+                if a_val == b_val {
+                    continue;
+                }
+                path.push(key.clone());
+                match (a_val, b_val) {
+                    (Some(av), Some(bv)) => {
+                        diff_values(av, bv, path, diffs, ignore_keys, ignore_paths)
+                    }
+                    _ => {
+                        diffs.insert(path.join("."));
+                    }
+                }
+                path.pop();
+            }
+        }
+        (Value::Array(a_arr), Value::Array(b_arr)) => {
+            if a_arr.len() != b_arr.len() {
+                diffs.insert(format!("{}[]", path.join(".")));
+                return;
+            }
+            for (av, bv) in a_arr.iter().zip(b_arr.iter()) {
+                if av != bv {
+                    diffs.insert(format!("{}[]", path.join(".")));
+                    break;
+                }
+            }
+        }
+        _ => {
+            diffs.insert(path.join("."));
+        }
+    }
+}
+
+fn is_ignored_path(path: &[String], ignore_paths: &[Vec<String>]) -> bool {
+    ignore_paths.iter().any(|ignore| ignore == path)
 }
 
 fn remove_keys_anywhere(value: &mut Value, ignore_keys: &HashSet<String>) {

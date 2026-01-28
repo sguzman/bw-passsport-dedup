@@ -50,6 +50,7 @@ use the ignore lists to control which fields are excluded.
 - `--sort-uris[=true|false]`: Sort `login.uris` before hashing (default: true)
 - `--policy-key <a,b,c>`: Override config policy keys (e.g., `domain,username,password`)
 - `--config <FILE>`: Load settings from a TOML file
+- `--report <FILE>`: Write a JSON report of duplicate groups
 
 ### Examples
 
